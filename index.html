@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pentomino Calendar Puzzle</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+
+  .controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  select, button {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid #3a3a50;
+    background: #252540;
+    color: #ddd;
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    outline: none;
+  }
+
+  select:hover, button:hover:not(:disabled) {
+    background: #30304a;
+    border-color: #5a5a70;
+  }
+
+  select:focus, button:focus {
+    border-color: #6a6a90;
+  }
+
+  button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  .nav-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 20px;
+  }
+
+  .status {
+    font-size: 0.85rem;
+    color: #888;
+    min-width: 140px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .board-wrap {
+    position: relative;
+    background: #3d2e1e;
+    border-radius: 16px;
+    padding: 10px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+
+  canvas#board {
+    width: clamp(280px, min(92vw, calc(100vh - 160px)), 720px);
+    display: block;
+    border-radius: 4px;
+  }
+
+  .overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.85);
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1rem;
+    color: #999;
+    transition: opacity 0.2s;
+  }
+
+  .overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .hint {
+    margin-top: 16px;
+    font-size: 0.75rem;
+    color: #555;
+  }
+</style>
+</head>
+<body>
+
+<div class="controls">
+  <select id="month"></select>
+  <select id="day"></select>
+</div>
+
+<div class="nav-controls">
+  <button id="prev" disabled>&larr;</button>
+  <span class="status" id="status"></span>
+  <button id="next" disabled>&rarr;</button>
+</div>
+
+<div class="board-wrap">
+  <canvas id="board"></canvas>
+  <div class="overlay hidden" id="overlay">Solving...</div>
+</div>
+
+<div class="hint">Arrow keys to browse solutions</div>
+
+<script>
+// --- Solver (runs in Web Worker) ---
+
+const SOLVER_CODE = `
+const ROWS = 7, COLS = 7;
+const BLOCKED = [[0,6],[1,6],[6,3],[6,4],[6,5],[6,6]];
+
+const MONTH_POS = {};
+for (let m = 1; m <= 12; m++) MONTH_POS[m] = [m <= 6 ? 0 : 1, (m - 1) % 6];
+
+const DAY_POS = {};
+for (let d = 1; d <= 31; d++) DAY_POS[d] = [Math.floor((d - 1) / 7) + 2, (d - 1) % 7];
+
+const PIECES = {
+  A: [[0,0],[1,0],[2,0],[2,1],[2,2]],
+  B: [[0,0],[1,0],[1,1],[1,2],[2,2]],
+  C: [[0,0],[0,1],[0,2],[0,3],[1,2]],
+  D: [[0,0],[1,0],[2,0],[3,0],[3,1]],
+  E: [[0,0],[0,1],[1,0],[2,0],[2,1]],
+  F: [[0,0],[0,1],[1,0],[1,1],[1,2]],
+  G: [[0,1],[0,2],[0,3],[1,0],[1,1]],
+  H: [[0,0],[0,1],[1,0],[1,1],[2,0],[2,1]],
+};
+
+function rotate90(cells) { return cells.map(([r, c]) => [c, -r]); }
+
+function normalize(cells) {
+  const minR = Math.min(...cells.map(([r]) => r));
+  const minC = Math.min(...cells.map(([, c]) => c));
+  const s = cells.map(([r, c]) => [r - minR, c - minC]);
+  s.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return s;
+}
+
+function allOrientations(cells) {
+  const seen = new Set();
+  const result = [];
+  let cur = cells;
+  for (let rot = 0; rot < 4; rot++) {
+    for (const v of [cur, cur.map(([r, c]) => [-r, c])]) {
+      const n = normalize(v);
+      const k = n.map(([r, c]) => r + "," + c).join("|");
+      if (!seen.has(k)) { seen.add(k); result.push(n); }
+    }
+    cur = rotate90(cur);
+  }
+  return result;
+}
+
+const PO = {};
+for (const [n, c] of Object.entries(PIECES)) PO[n] = allOrientations(c);
+const PN = Object.keys(PIECES);
+
+function solveAll(month, day) {
+  const board = new Uint8Array(ROWS * COLS);
+  const labels = new Array(ROWS * COLS).fill(".");
+
+  for (const [r, c] of BLOCKED) board[r * COLS + c] = 1;
+  board[MONTH_POS[month][0] * COLS + MONTH_POS[month][1]] = 1;
+  board[DAY_POS[day][0] * COLS + DAY_POS[day][1]] = 1;
+
+  const solutions = [];
+
+  function bt(used) {
+    let idx = -1;
+    for (let i = 0; i < ROWS * COLS; i++) { if (!board[i]) { idx = i; break; } }
+    if (idx === -1) { solutions.push([...labels]); return; }
+
+    const r = (idx / COLS) | 0, c = idx % COLS;
+
+    for (let i = 0; i < PN.length; i++) {
+      if (used & (1 << i)) continue;
+      const name = PN[i];
+
+      for (const orient of PO[name]) {
+        for (const [dr, dc] of orient) {
+          const or_ = r - dr, oc = c - dc;
+          let valid = true;
+          const pos = [];
+
+          for (const [pr, pc] of orient) {
+            const nr = or_ + pr, nc = oc + pc;
+            if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS || board[nr * COLS + nc]) {
+              valid = false; break;
+            }
+            pos.push(nr * COLS + nc);
+          }
+
+          if (valid) {
+            for (const p of pos) { board[p] = 1; labels[p] = name; }
+            bt(used | (1 << i));
+            for (const p of pos) { board[p] = 0; labels[p] = "."; }
+          }
+        }
+      }
+    }
+  }
+
+  bt(0);
+  return solutions;
+}
+
+self.onmessage = function(e) {
+  const { month, day } = e.data;
+  const solutions = solveAll(month, day);
+  self.postMessage({ solutions });
+};
+`;
+
+// --- Constants ---
+
+const ROWS = 7, COLS = 7;
+const BLOCKED_SET = new Set([[0,6],[1,6],[6,3],[6,4],[6,5],[6,6]].map(([r,c]) => r * COLS + c));
+const MONTHS_RU = ["Янв","Февр","Март","Апр","Май","Июнь","Июль","Авг","Сент","Окт","Нояб","Дек"];
+
+const MONTH_POS = {};
+for (let m = 1; m <= 12; m++) MONTH_POS[m] = [m <= 6 ? 0 : 1, (m - 1) % 6];
+
+const DAY_POS = {};
+for (let d = 1; d <= 31; d++) DAY_POS[d] = [((d - 1) / 7 | 0) + 2, (d - 1) % 7];
+
+const LABELS = [];
+for (let r = 0; r < ROWS; r++) {
+  LABELS[r] = [];
+  for (let c = 0; c < COLS; c++) {
+    if (r < 2) {
+      const idx = r * 6 + c;
+      LABELS[r][c] = idx < 12 ? MONTHS_RU[idx] : "";
+    } else {
+      const d = (r - 2) * 7 + c + 1;
+      LABELS[r][c] = d <= 31 ? String(d) : "";
+    }
+  }
+}
+
+const FRAME = '#3d2e1e';
+const PIECE_COLORS = {
+  A: '#c0392b', B: '#2980b9', C: '#27ae60', D: '#d4a017',
+  E: '#8e44ad', F: '#16a085', G: '#d35400', H: '#546e7a',
+};
+
+// --- Worker setup ---
+
+let workerUrl = null;
+let worker = null;
+let useWorker = true;
+
+try {
+  const blob = new Blob([SOLVER_CODE], { type: "application/javascript" });
+  workerUrl = URL.createObjectURL(blob);
+} catch (e) {
+  useWorker = false;
+}
+
+function createWorker() {
+  if (worker) worker.terminate();
+  try {
+    worker = new Worker(workerUrl);
+    return worker;
+  } catch (e) {
+    useWorker = false;
+    return null;
+  }
+}
+
+// Fallback inline solver
+function solveInline(month, day) {
+  const R = 7, C = 7;
+  const BL = [[0,6],[1,6],[6,3],[6,4],[6,5],[6,6]];
+  const MP = {}; for (let m=1;m<=12;m++) MP[m]=[m<=6?0:1,(m-1)%6];
+  const DP = {}; for (let d=1;d<=31;d++) DP[d]=[((d-1)/7|0)+2,(d-1)%7];
+  const PS = {
+    A:[[0,0],[1,0],[2,0],[2,1],[2,2]],B:[[0,0],[1,0],[1,1],[1,2],[2,2]],
+    C:[[0,0],[0,1],[0,2],[0,3],[1,2]],D:[[0,0],[1,0],[2,0],[3,0],[3,1]],
+    E:[[0,0],[0,1],[1,0],[2,0],[2,1]],F:[[0,0],[0,1],[1,0],[1,1],[1,2]],
+    G:[[0,1],[0,2],[0,3],[1,0],[1,1]],H:[[0,0],[0,1],[1,0],[1,1],[2,0],[2,1]],
+  };
+  function rot(cs){return cs.map(([r,c])=>[c,-r])}
+  function norm(cs){
+    const mr=Math.min(...cs.map(([r])=>r)),mc=Math.min(...cs.map(([,c])=>c));
+    const s=cs.map(([r,c])=>[r-mr,c-mc]);s.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);return s;
+  }
+  function ao(cs){
+    const seen=new Set(),res=[];let cur=cs;
+    for(let rot_=0;rot_<4;rot_++){
+      for(const v of [cur,cur.map(([r,c])=>[-r,c])]){
+        const n=norm(v),k=n.map(([r,c])=>r+","+c).join("|");
+        if(!seen.has(k)){seen.add(k);res.push(n);}
+      }
+      cur=rot(cur);
+    }
+    return res;
+  }
+  const PO={};for(const[n,c] of Object.entries(PS))PO[n]=ao(c);
+  const PN=Object.keys(PS);
+  const board=new Uint8Array(R*C),labels=new Array(R*C).fill(".");
+  for(const[r,c] of BL) board[r*C+c]=1;
+  board[MP[month][0]*C+MP[month][1]]=1;
+  board[DP[day][0]*C+DP[day][1]]=1;
+  const sols=[];
+  function bt(used){
+    let idx=-1;for(let i=0;i<R*C;i++)if(!board[i]){idx=i;break;}
+    if(idx===-1){sols.push([...labels]);return;}
+    const r=(idx/C)|0,c=idx%C;
+    for(let i=0;i<PN.length;i++){
+      if(used&(1<<i))continue;const name=PN[i];
+      for(const orient of PO[name]){
+        for(const[dr,dc] of orient){
+          const or_=r-dr,oc=c-dc;let valid=true;const pos=[];
+          for(const[pr,pc] of orient){
+            const nr=or_+pr,nc=oc+pc;
+            if(nr<0||nr>=R||nc<0||nc>=C||board[nr*C+nc]){valid=false;break;}
+            pos.push(nr*C+nc);
+          }
+          if(valid){
+            for(const p of pos){board[p]=1;labels[p]=name;}
+            bt(used|(1<<i));
+            for(const p of pos){board[p]=0;labels[p]=".";}
+          }
+        }
+      }
+    }
+  }
+  bt(0);
+  return sols;
+}
+
+// --- DOM ---
+
+const monthEl = document.getElementById("month");
+const dayEl = document.getElementById("day");
+const prevEl = document.getElementById("prev");
+const nextEl = document.getElementById("next");
+const statusEl = document.getElementById("status");
+const boardEl = document.getElementById("board");
+const overlayEl = document.getElementById("overlay");
+
+MONTHS_RU.forEach((name, i) => {
+  const o = document.createElement("option");
+  o.value = i + 1;
+  o.textContent = name;
+  monthEl.appendChild(o);
+});
+
+for (let d = 1; d <= 31; d++) {
+  const o = document.createElement("option");
+  o.value = d;
+  o.textContent = d;
+  dayEl.appendChild(o);
+}
+
+const today = new Date();
+monthEl.value = today.getMonth() + 1;
+dayEl.value = today.getDate();
+
+// --- State ---
+
+let solutions = [];
+let index = 0;
+
+// --- Canvas rendering ---
+
+function render(sol, month, day) {
+  const canvas = boardEl;
+  const cssW = canvas.clientWidth;
+  if (cssW === 0) return;
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssW * dpr);
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const cellW = cssW / COLS;
+  const cellH = cssW / ROWS;
+  const [mr, mc] = MONTH_POS[month];
+  const [dr, dc] = DAY_POS[day];
+  const lineW = Math.max(2, Math.round(cssW / 140));
+  const halfLine = lineW / 2;
+  const cornerR = Math.round(cssW / 70);
+
+  // Cell type: '~' = frame/blocked, '*' = exposed, '.' = empty, else piece letter
+  function ct(r, c) {
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return '~';
+    if (BLOCKED_SET.has(r * COLS + c)) return '~';
+    if ((r === mr && c === mc) || (r === dr && c === dc)) return '*';
+    return sol ? sol[r * COLS + c] : '.';
+  }
+
+  function cc(type) {
+    if (type === '~') return FRAME;
+    if (type === '*') return '#f0e8d8';
+    if (type === '.') return '#4a3828';
+    return PIECE_COLORS[type] || FRAME;
+  }
+
+  // 1. Fill all cells edge-to-edge
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      ctx.fillStyle = cc(ct(r, c));
+      ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
+    }
+  }
+
+  // 2. Draw outlines as filled rectangles between different cell types.
+  //    Each rect extends halfLine beyond its span to fill corner junctions.
+  ctx.fillStyle = FRAME;
+
+  for (let r = 1; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (ct(r - 1, c) !== ct(r, c)) {
+        ctx.fillRect(
+          c * cellW - halfLine,
+          r * cellH - halfLine,
+          cellW + lineW,
+          lineW
+        );
+      }
+    }
+  }
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 1; c < COLS; c++) {
+      if (ct(r, c - 1) !== ct(r, c)) {
+        ctx.fillRect(
+          c * cellW - halfLine,
+          r * cellH - halfLine,
+          lineW,
+          cellH + lineW
+        );
+      }
+    }
+  }
+
+  // 3. Redraw exposed cells with rounded corners on top
+  function roundRect(x, y, w, h, rad) {
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.lineTo(x + w - rad, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + rad);
+    ctx.lineTo(x + w, y + h - rad);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - rad, y + h);
+    ctx.lineTo(x + rad, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - rad);
+    ctx.lineTo(x, y + rad);
+    ctx.quadraticCurveTo(x, y, x + rad, y);
+    ctx.closePath();
+  }
+
+  for (const [er, ec] of [[mr, mc], [dr, dc]]) {
+    const inset = halfLine + 1;
+    const x = ec * cellW + inset;
+    const y = er * cellH + inset;
+    const w = cellW - inset * 2;
+    const h = cellH - inset * 2;
+
+    // Fill
+    ctx.fillStyle = '#f0e8d8';
+    roundRect(x, y, w, h, cornerR);
+    ctx.fill();
+
+    // Subtle inner shadow
+    ctx.save();
+    roundRect(x, y, w, h, cornerR);
+    ctx.clip();
+    ctx.shadowColor = 'rgba(0,0,0,0.1)';
+    ctx.shadowBlur = 4;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 2;
+    ctx.fillRect(x - 20, y - 20, w + 40, 20);
+    ctx.restore();
+
+    // Label
+    ctx.fillStyle = '#3d2e1e';
+    const fontSize = Math.round(cellW * 0.32);
+    ctx.font = `700 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(LABELS[er][ec], ec * cellW + cellW / 2, er * cellH + cellH / 2);
+  }
+
+  // 4. Labels on empty cells (before solution is found)
+  if (!sol) {
+    ctx.fillStyle = '#6a5a4a';
+    const fontSize = Math.round(cellW * 0.28);
+    ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (ct(r, c) === '.' && LABELS[r][c]) {
+          ctx.fillText(LABELS[r][c], c * cellW + cellW / 2, r * cellH + cellH / 2);
+        }
+      }
+    }
+  }
+}
+
+function updateNav() {
+  prevEl.disabled = index <= 0;
+  nextEl.disabled = index >= solutions.length - 1;
+  statusEl.textContent = solutions.length > 0
+    ? `${index + 1} / ${solutions.length}`
+    : "";
+}
+
+function show(i) {
+  index = i;
+  render(solutions[i], +monthEl.value, +dayEl.value);
+  updateNav();
+}
+
+// --- Solving ---
+
+function handleSolutions(sols) {
+  overlayEl.classList.add("hidden");
+  solutions = sols;
+  if (solutions.length > 0) {
+    show(0);
+  } else {
+    statusEl.textContent = "No solutions";
+  }
+}
+
+function startSolve() {
+  const month = +monthEl.value;
+  const day = +dayEl.value;
+
+  solutions = [];
+  index = 0;
+  prevEl.disabled = true;
+  nextEl.disabled = true;
+  statusEl.textContent = "...";
+  overlayEl.classList.remove("hidden");
+  render(null, month, day);
+
+  if (useWorker) {
+    const w = createWorker();
+    if (w) {
+      w.onmessage = (e) => handleSolutions(e.data.solutions);
+      w.onerror = () => {
+        useWorker = false;
+        setTimeout(() => handleSolutions(solveInline(month, day)), 16);
+      };
+      w.postMessage({ month, day });
+      return;
+    }
+  }
+
+  setTimeout(() => handleSolutions(solveInline(month, day)), 16);
+}
+
+// --- Events ---
+
+monthEl.addEventListener("change", startSolve);
+dayEl.addEventListener("change", startSolve);
+
+prevEl.addEventListener("click", () => { if (index > 0) show(index - 1); });
+nextEl.addEventListener("click", () => { if (index < solutions.length - 1) show(index + 1); });
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft" && index > 0) { show(index - 1); e.preventDefault(); }
+  if (e.key === "ArrowRight" && index < solutions.length - 1) { show(index + 1); e.preventDefault(); }
+});
+
+// Re-render on resize
+new ResizeObserver(() => {
+  if (solutions.length > 0) show(index);
+  else render(null, +monthEl.value, +dayEl.value);
+}).observe(boardEl);
+
+// --- Init ---
+
+startSolve();
+</script>
+</body>
+</html>
